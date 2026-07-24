@@ -1,0 +1,186 @@
+import os
+import sys
+import json
+import requests
+from dotenv import load_dotenv
+from groq import Groq
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.markdown import Markdown
+from rich.prompt import Prompt
+
+# Initialize Rich Console
+console = Console()
+
+load_dotenv()
+API_KEY = os.getenv("GROQ_API_KEY")
+
+if not API_KEY:
+    console.print("[bold red][ERROR]: Security Violation. Valid GROQ_API_KEY missing from environment context.[/bold red]")
+    sys.exit(1)
+
+client = Groq(api_key=API_KEY)
+# Using a fast, highly capable model for logistics
+MODEL_NAME = "llama-3.3-70b-versatile" 
+
+# =====================================================================
+# TOOL: Weather API Integration
+# =====================================================================
+def get_current_weather(location: str) -> str:
+    """Fetches real-time weather globally and normalizes both Celsius and Fahrenheit scales."""
+    try:
+        clean_location = location.strip().replace(' ', '+')
+        url = f"https://wttr.in/{clean_location}?format=%t+%C"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            raw_output = response.text.strip() 
+            
+            # Extract numbers safely
+            digits = "".join([c for c in raw_output.split("°")[0] if c.isdigit() or c == '-'])
+            if not digits:
+                return f"Error: Could not parse temperature data from service for {location}."
+                
+            temp_value = int(digits)
+            condition = raw_output.split("°")[-1][1:].strip() 
+            
+            if "F" in raw_output:
+                fahrenheit = temp_value
+                celsius = int((fahrenheit - 32) * 5/9)
+            else:
+                celsius = temp_value
+                fahrenheit = int((celsius * 9/5) + 32)
+                
+            return f"Weather in {location}: {celsius}°C ({fahrenheit}°F) | Condition: {condition}"
+        return f"Error: Could not retrieve live data. Service returned status {response.status_code}."
+    except Exception as e:
+        return f"Weather tool error: {str(e)}"
+
+# Groq requires explicit JSON schema mapping for tools
+weather_tool_schema = {
+    "type": "function",
+    "function": {
+        "name": "get_current_weather",
+        "description": "Fetches real-time weather for a specific location. Always use this to get the latest conditions before advising.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": "The destination city name (e.g., 'Lahore', 'Tokyo')"
+                }
+            },
+            "required": ["location"]
+        }
+    }
+}
+
+# =====================================================================
+# MAIN CLI PIPELINE
+# =====================================================================
+def main():
+    console.print(Panel.fit(
+        "[bold cyan]Multi-Agent Weather & Logistics Concierge[/bold cyan]\n"
+        "[dim]Powered by Groq SDK[/dim]",
+        border_style="cyan"
+    ))
+
+    # Interactive input
+    target_city = Prompt.ask("\n[bold yellow]Enter your destination city[/bold yellow]").strip()
+
+    if not target_city:
+        console.print("[bold red][ERROR]: City input cannot be empty. Exiting.[/bold red]")
+        sys.exit(1)
+
+    # AGENT 1: Weather & Predictive Logistics Specialist
+    agent_1_instruction = """
+    You are a highly analytical logistics agent.
+    1. Execute the get_current_weather tool to extract raw metrics.
+    2. Analyze the condition and temperature.
+    3. Explicitly predict and advise on local transport options (e.g., closed car vs. bike/motorcycle/walking) based strictly on current weather.
+    4. Explicitly advise on utility gear required (e.g., umbrella, heavy coat, N95 mask for smoke/smog).
+    Keep output structured, concise, and analytical.
+    """
+
+    messages = [
+        {"role": "system", "content": agent_1_instruction},
+        {"role": "user", "content": f"I am traveling to {target_city}. Provide a weather report, logistics prediction, and styling profile."}
+    ]
+
+    with console.status("[bold blue]Agent 1 (Logistics Specialist): Fetching live weather & calculating transit risk...[/bold blue]", spinner="dots"):
+        # Turn 1: Hand the prompt and tool definition to Groq
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            tools=[weather_tool_schema],
+            tool_choice="auto",
+            temperature=0.2,
+        )
+        
+        response_message = response.choices[0].message
+        
+        # Turn 2: The Orchestration Loop
+        if response_message.tool_calls:
+            # We must append the model's exact tool call request to the message history
+            messages.append(response_message)
+            
+            for tool_call in response_message.tool_calls:
+                if tool_call.function.name == "get_current_weather":
+                    # Parse arguments generated by the model
+                    args = json.loads(tool_call.function.arguments)
+                    tool_result = get_current_weather(args.get("location", target_city))
+                    
+                    # Feed the python execution result back into the context window
+                    messages.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "name": "get_current_weather",
+                        "content": tool_result
+                    })
+            
+            # Turn 3: Get the final synthesized response
+            final_response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=0.2
+            )
+            raw_logistics_report = final_response.choices[0].message.content
+        else:
+            # Failsafe: if the model decides it doesn't need a tool (which it should, based on instructions)
+            raw_logistics_report = response_message.content
+
+    # Render Agent 1 via Rich Markdown
+    console.print("\n")
+    console.print(Panel(
+        Markdown(raw_logistics_report),
+        title="[bold blue]Agent 1: Weather & Logistics Brief[/bold blue]",
+        border_style="blue",
+        padding=(1, 2)
+    ))
+
+    # AGENT 2: Concierge Fashion Expert
+    agent_2_instruction = "You are an expert travel stylist. Turn logistics and environmental metrics into a structured, highly actionable packing list. Do not waste time with conversational fluff."
+    
+    with console.status("[bold green]Agent 2 (Stylist Expert): Synthesizing metrics into a curated packing strategy...[/bold green]", spinner="dots"):
+        agent_2_response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": agent_2_instruction},
+                {"role": "user", "content": f"Based on this logistical data: {raw_logistics_report}. Generate an actionable packing list and outfit strategy."}
+            ],
+            temperature=0.5,
+        )
+        final_styling_report = agent_2_response.choices[0].message.content
+
+    # Render Agent 2 via Rich Markdown
+    console.print("\n")
+    console.print(Panel(
+        Markdown(final_styling_report),
+        title="[bold green]Agent 2: Tailored Wardrobe & Packing Guide[/bold green]",
+        border_style="green",
+        padding=(1, 2)
+    ))
+
+if __name__ == "__main__":
+    main()
